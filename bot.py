@@ -22,16 +22,14 @@ ADMIN_IDS = {int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.
 TZ = os.getenv("TZ", "Europe/Moscow")
 DB_PATH = "predictions.sqlite3"
 
-# Очки: в этой версии без общего банка/лимита (по запросу пользователя)
+# Баланс
+START_BALANCE = 1000  # стартовый баланс новым пользователям
 MIN_POINTS = 1
 MAX_POINTS = 10_000
 
 # Точность: допуск = 10% от прогноза пользователя
 TOLERANCE_RATE = Decimal("0.10")
 
-# Чтобы не было T=0 для прогноза 0 (или слишком мелких чисел)
-# используем минимальный допуск = step
-# (step задаётся на вопросе)
 # ---------------- HELPERS ----------------
 def now_tz() -> datetime:
     return datetime.now(ZoneInfo(TZ))
@@ -49,17 +47,13 @@ def validate_step(value: Decimal, step: Decimal) -> bool:
     return q == q.to_integral_value()
 
 def to_minutes_hhmm(s: str, step_min: int) -> int | None:
-    """
-    HH:MM -> minutes from 00:00
-    """
     s = s.strip()
     if ":" not in s:
         return None
     hh, mm = s.split(":", 1)
     if not (hh.isdigit() and mm.isdigit()):
         return None
-    h = int(hh)
-    m = int(mm)
+    h = int(hh); m = int(mm)
     if h < 0 or h > 23 or m < 0 or m > 59:
         return None
     total = h * 60 + m
@@ -74,7 +68,6 @@ def minutes_to_hhmm(minutes: int) -> str:
     return f"{h:02d}:{m:02d}"
 
 def k_unique_from_ratio(r: Decimal) -> Decimal:
-    # r = k/N
     if r <= Decimal("0.07"):
         return Decimal("2.8")
     if r <= Decimal("0.17"):
@@ -86,28 +79,21 @@ def k_unique_from_ratio(r: Decimal) -> Decimal:
 def k_accuracy(err: Decimal, T: Decimal) -> Decimal:
     if err > T:
         return Decimal("0")
-    # 1 + (1 - err/T) in [1;2]
     return (Decimal("1") + (Decimal("1") - (err / T))).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 def compute_bin(value: Decimal, W: Decimal) -> int:
-    # bin = floor(value / W)
     return int((value / W).to_integral_value(rounding=ROUND_FLOOR))
 
 def choose_cluster_width_W(step: Decimal, all_forecasts: list[Decimal]) -> Decimal:
     """
-    Уникальность должна считаться по общим кластерам. При этом допуск точности теперь персональный (10% от прогноза),
-    поэтому W выбираем единообразно по вопросу в момент закрытия.
-
-    Простое и устойчивое правило:
+    Уникальность: единая ширина кластера по вопросу.
     W = max(step, 10% от медианы |прогнозов|)
-
-    Это "в духе 10%", но даёт одну ширину кластера для всех.
     """
     if not all_forecasts:
         return step if step > 0 else Decimal("1")
 
     abs_vals = [abs(x) for x in all_forecasts]
-    m = Decimal(str(median([float(x) for x in abs_vals])))  # медиана через float; достаточно для W
+    m = Decimal(str(median([float(x) for x in abs_vals])))
     W = (m * TOLERANCE_RATE)
     if W <= 0:
         W = step if step > 0 else Decimal("1")
@@ -116,12 +102,19 @@ def choose_cluster_width_W(step: Decimal, all_forecasts: list[Decimal]) -> Decim
     return W.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 # ---------------- DB ----------------
+async def _ensure_column(db: aiosqlite.Connection, table: str, col: str, ddl: str):
+    cur = await db.execute(f"PRAGMA table_info({table});")
+    cols = [r[1] for r in await cur.fetchall()]
+    if col not in cols:
+        await db.execute(ddl)
+
 async def db_init():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             full_name TEXT,
+            balance INTEGER NOT NULL DEFAULT 1000,
             created_at TEXT NOT NULL
         );
         """)
@@ -148,16 +141,36 @@ async def db_init():
             FOREIGN KEY (question_id) REFERENCES questions(id)
         );
         """)
+        # миграция для старых баз (если уже были таблицы без balance)
+        await _ensure_column(
+            db, "users", "balance",
+            "ALTER TABLE users ADD COLUMN balance INTEGER NOT NULL DEFAULT 1000;"
+        )
         await db.commit()
 
 async def upsert_user(user_id: int, full_name: str):
     async with aiosqlite.connect(DB_PATH) as db:
+        # создаём пользователя с балансом START_BALANCE, если его нет
         await db.execute("""
-        INSERT INTO users(user_id, full_name, created_at)
-        VALUES(?,?,?)
+        INSERT INTO users(user_id, full_name, balance, created_at)
+        VALUES(?,?,?,?)
         ON CONFLICT(user_id) DO UPDATE SET full_name=excluded.full_name
-        """, (user_id, full_name or "", now_tz().isoformat()))
+        """, (user_id, full_name or "", START_BALANCE, now_tz().isoformat()))
         await db.commit()
+
+async def get_balance(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else START_BALANCE
+
+async def add_balance(user_id: int, delta: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance = balance + ? WHERE user_id=?", (delta, user_id))
+        await db.commit()
+        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
 async def create_question(title: str, qtype: str, step: str) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -182,6 +195,13 @@ async def get_question(qid: int):
         cur = await db.execute("""
         SELECT id, title, qtype, step, status, fact_value FROM questions WHERE id=?
         """, (qid,))
+        return await cur.fetchone()
+
+async def get_bet(user_id: int, qid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+        SELECT forecast_value, points FROM bets WHERE user_id=? AND question_id=?
+        """, (user_id, qid))
         return await cur.fetchone()
 
 async def upsert_bet(user_id: int, qid: int, forecast_value: str, points: int):
@@ -225,13 +245,24 @@ async def get_question_bets(qid: int):
         """, (qid,))
         return await cur.fetchall()
 
+async def get_users_map(user_ids: list[int]) -> dict[int, str]:
+    if not user_ids:
+        return {}
+    qmarks = ",".join(["?"] * len(user_ids))
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({qmarks})", tuple(user_ids))
+        rows = await cur.fetchall()
+        return {int(uid): (name or str(uid)) for uid, name in rows}
+
 # ---------------- UI ----------------
 def kb_main(is_admin: bool):
     kb = InlineKeyboardBuilder()
     kb.button(text="Сделать прогноз", callback_data="bet:start")
     kb.button(text="Мои ставки", callback_data="bet:mine")
+    kb.button(text="Посмотреть баланс", callback_data="user:balance")
     if is_admin:
         kb.button(text="Админ: создать вопрос", callback_data="admin:create")
+        kb.button(text="Админ: показать ставки", callback_data="admin:showbets_pick")
         kb.button(text="Админ: закрыть вопрос (ввести факт)", callback_data="admin:settle_pick")
     kb.adjust(1)
     return kb.as_markup()
@@ -247,8 +278,7 @@ def kb_questions(rows, prefix: str):
 # ---------------- BOT ----------------
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
-
-STATE: dict[int, dict] = {}  # user_id -> state dict
+STATE: dict[int, dict] = {}
 
 @dp.message(F.text.in_({"/start", "/help"}))
 async def start(m: Message):
@@ -268,6 +298,13 @@ async def menu(c: CallbackQuery):
     is_admin = c.from_user.id in ADMIN_IDS
     await c.message.edit_text("Меню:", reply_markup=kb_main(is_admin))
     await c.answer()
+
+@dp.callback_query(F.data == "user:balance")
+async def user_balance(c: CallbackQuery):
+    await upsert_user(c.from_user.id, c.from_user.full_name or "")
+    bal = await get_balance(c.from_user.id)
+    await c.answer()
+    await c.message.edit_text(f"Ваш баланс: {bal} очков")
 
 # ----------- USER: BET FLOW -----------
 @dp.callback_query(F.data == "bet:start")
@@ -334,6 +371,59 @@ async def admin_create(c: CallbackQuery):
         return
     STATE[c.from_user.id] = {"stage": "admin_create_title"}
     await c.message.edit_text("Создание вопроса.\n\nВведите текст вопроса (title).")
+    await c.answer()
+
+# ----------- ADMIN: SHOW BETS -----------
+@dp.callback_query(F.data == "admin:showbets_pick")
+async def admin_showbets_pick(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    rows = await list_open_questions()
+    if not rows:
+        await c.answer("Нет открытых вопросов.", show_alert=True)
+        return
+    STATE[c.from_user.id] = {"stage": "admin_showbets_choose"}
+    await c.message.edit_text("Выберите вопрос, чтобы посмотреть ставки:", reply_markup=kb_questions(rows, "admin:showbets"))
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("admin:showbets:"))
+async def admin_showbets(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        await c.answer("Нет доступа.", show_alert=True)
+        return
+    qid = int(c.data.split(":")[-1])
+    q = await get_question(qid)
+    if not q:
+        await c.answer("Вопрос не найден.", show_alert=True)
+        return
+
+    _, title, qtype, step, status, _fact = q
+    bets = await get_question_bets(qid)
+    if not bets:
+        await c.message.edit_text(f"Вопрос #{qid}: {title}\n\nСтавок пока нет.")
+        await c.answer()
+        return
+
+    user_ids = [int(b[0]) for b in bets]
+    names = await get_users_map(user_ids)
+
+    # выводим списком, без усложнения пагинацией (MVP)
+    lines = [f"Ставки по вопросу #{qid} ({status})", title, ""]
+    for user_id, fv, points in bets:
+        name = names.get(int(user_id), str(user_id))
+        if qtype == "TIME":
+            fv_disp = minutes_to_hhmm(int(fv))
+        else:
+            fv_disp = fv
+        lines.append(f"• {name}: {fv_disp} / {points}")
+
+    # Telegram лимит ~4096 символов: если очень много ставок — режем.
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…(обрезано, слишком много ставок)"
+
+    await c.message.edit_text(text)
     await c.answer()
 
 # ----------- ADMIN: SETTLE QUESTION -----------
@@ -419,15 +509,30 @@ async def on_text(m: Message):
         except Exception:
             return await m.answer("Очки должны быть целым числом.")
         if pts < MIN_POINTS or pts > MAX_POINTS:
-            return await m.answer(f"Очки должны быть в диапазоне {MIN_POINTS}–{MAX_POINTS}.")
+            return await m.answer(f"Очки должны быть {MIN_POINTS}–{MAX_POINTS}.")
+
+        # баланс: учитываем перезапись ставки
+        await upsert_user(uid, m.from_user.full_name or "")
+        old = await get_bet(uid, qid)  # (forecast_value, points) or None
+        old_points = int(old[1]) if old else 0
+
+        bal = await get_balance(uid)
+        delta_need = pts - old_points
+        if delta_need > 0 and bal < delta_need:
+            return await m.answer(f"Недостаточно баланса. Нужно {delta_need}, у вас {bal}.")
+
+        # списываем/возвращаем разницу
+        if delta_need != 0:
+            await add_balance(uid, -delta_need)
+            bal = await get_balance(uid)
 
         _, title, qtype, step, status, _fact = q
         forecast_value = st["forecast_value"]
         await upsert_bet(uid, qid, forecast_value, pts)
 
-        # Показываем кластер и диапазон уникальности "на сейчас"
+        # Показываем кластер и текущий K_unique
         bets = await get_question_bets(qid)
-        all_forecasts = []
+
         if qtype == "NUM":
             all_forecasts = [Decimal(b[1]) for b in bets]
             my_v = Decimal(forecast_value)
@@ -435,27 +540,20 @@ async def on_text(m: Message):
         else:
             all_forecasts = [Decimal(int(b[1])) for b in bets]
             my_v = Decimal(int(forecast_value))
-            step_d = Decimal(int(step))  # minutes
+            step_d = Decimal(int(step))
 
         W = choose_cluster_width_W(step_d, all_forecasts)
         my_bin = compute_bin(my_v, W)
 
-        # cluster count k and N so far
         k = 0
         for _u, fv, _p in bets:
             v = Decimal(fv) if qtype == "NUM" else Decimal(int(fv))
             if compute_bin(v, W) == my_bin:
                 k += 1
         N = len(bets)
-
-        # диапазон уникальности до закрытия (используем текущий N и k как "на сейчас")
-        # так как пользователей не знаем заранее, показываем честный интервал при предположении, что N уже финальный:
-        # (проще и не вводит в заблуждение).
-        # Если хочешь "как раньше" с верхней границей участников — можно добавить TOTAL_USERS.
         ratio = Decimal(k) / Decimal(N) if N else Decimal("1")
         kuniq_now = k_unique_from_ratio(ratio)
 
-        # кластерный интервал:
         cluster_from = (Decimal(my_bin) * W)
         cluster_to = (Decimal(my_bin + 1) * W)
 
@@ -473,9 +571,9 @@ async def on_text(m: Message):
             f"Вопрос #{qid}: {title}\n"
             f"Прогноз: {my_disp}\n"
             f"Очки: {pts}\n"
-            f"Кластер (для уникальности): {cluster_text}\n"
-            f"Текущий K_unique (может измениться пока вопрос открыт): {kuniq_now}\n\n"
-            f"Меню: /start",
+            f"Кластер (уникальность): {cluster_text}\n"
+            f"Текущий K_unique: {kuniq_now} (может измениться пока вопрос открыт)\n"
+            f"Баланс: {bal}",
             reply_markup=kb_main(is_admin)
         )
 
@@ -558,23 +656,20 @@ async def on_text(m: Message):
                 return await m.answer("Введите число.")
             fact_str = str(fact)
         else:
-            step_min = int(step)
-            mins = to_minutes_hhmm(m.text, step_min=1)  # факт разрешаем любой HH:MM, без кратности шагу
+            mins = to_minutes_hhmm(m.text, step_min=1)  # факт принимаем любой HH:MM
             if mins is None:
                 return await m.answer("Введите время в формате HH:MM.")
             fact_str = str(mins)
 
-        # Закрываем вопрос
         await settle_question(qid, fact_str)
 
-        # Считаем и рассылаем результаты всем, кто ставил
         bets = await get_question_bets(qid)
         if not bets:
             STATE.pop(uid, None)
             is_admin = uid in ADMIN_IDS
             return await m.answer(f"Вопрос #{qid} закрыт. Ставок не было.", reply_markup=kb_main(is_admin))
 
-        # Готовим общие данные для уникальности (по вопросу)
+        # Уникальность: общая ширина W
         if qtype == "NUM":
             forecasts = [Decimal(b[1]) for b in bets]
             fact_val = Decimal(fact_str)
@@ -585,39 +680,39 @@ async def on_text(m: Message):
             step_d = Decimal(int(step))
 
         W = choose_cluster_width_W(step_d, forecasts)
-
-        # Предподсчёт k по bin
         bins = [compute_bin(v, W) for v in forecasts]
         N = len(bins)
         bin_counts = {}
         for b in bins:
             bin_counts[b] = bin_counts.get(b, 0) + 1
 
-        # Рассылка каждому
+        # Рассылка + начисление в баланс
         for user_id, fv, points in bets:
+            await upsert_user(int(user_id), "")  # на случай если пользователь появился до миграции
             user_forecast = Decimal(fv) if qtype == "NUM" else Decimal(int(fv))
             err = (user_forecast - fact_val).copy_abs()
 
-            # персональный допуск точности: 10% от прогноза пользователя, но не меньше step
+            # персональный допуск: 10% от прогноза, но не меньше step
             T_user = (abs(user_forecast) * TOLERANCE_RATE)
             if T_user < step_d:
                 T_user = step_d
-            # точность
+
             acc = k_accuracy(err, T_user)
 
-            # уникальность
-            b = compute_bin(user_forecast, W)
-            k = bin_counts.get(b, 0)
-            ratio = Decimal(k) / Decimal(N) if N else Decimal("1")
+            bbin = compute_bin(user_forecast, W)
+            k = bin_counts.get(bbin, 0)
+            ratio = (Decimal(k) / Decimal(N)) if N else Decimal("1")
             kuniq = k_unique_from_ratio(ratio)
 
-            # выигрыш (сложность = 1.0 для универсальных вопросов)
             if acc == 0:
-                w = Decimal("0")
+                payout = Decimal("0")
             else:
-                w = (Decimal(points) * acc * kuniq).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                payout = (Decimal(points) * acc * kuniq).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-            # форматирование
+            # начисляем payout в баланс (округляем вниз до целых очков)
+            credit = int(payout.to_integral_value(rounding=ROUND_FLOOR))
+            new_bal = await add_balance(int(user_id), credit)
+
             if qtype == "TIME":
                 forecast_disp = minutes_to_hhmm(int(user_forecast))
                 fact_disp = minutes_to_hhmm(int(fact_val))
@@ -626,7 +721,6 @@ async def on_text(m: Message):
             else:
                 forecast_disp = str(user_forecast)
                 fact_disp = str(fact_val)
-                # покажем допуск как число (округлим)
                 t_disp = f"±{round_display(T_user,'0.1')}"
                 err_disp = round_display(err, "0.1")
 
@@ -639,28 +733,28 @@ async def on_text(m: Message):
                 f"Ваш допуск (10%): {t_disp}\n\n"
                 f"K_accuracy: {acc}\n"
                 f"K_unique: {kuniq} (k={k}/N={N})\n"
-                f"Очки: {points}\n"
-                f"Итог: {w}"
+                f"Очки ставки: {points}\n"
+                f"Начислено: {credit}\n"
+                f"Баланс: {new_bal}"
             )
             try:
-                await bot.send_message(user_id, msg)
+                await bot.send_message(int(user_id), msg)
             except Exception:
-                # пользователь мог не открыть бота/запретить сообщения — в MVP просто игнорируем
                 pass
 
         STATE.pop(uid, None)
         is_admin = uid in ADMIN_IDS
         return await m.answer(
-            f"✅ Вопрос #{qid} закрыт, факт сохранён, уведомления участникам отправлены.",
+            f"✅ Вопрос #{qid} закрыт, факт сохранён, начисления и уведомления отправлены.",
             reply_markup=kb_main(is_admin)
         )
 
 # ---------------- MAIN ----------------
 async def main():
     await db_init()
+    # Важно для хостинга: сбрасываем webhook, чтобы polling работал стабильно
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
